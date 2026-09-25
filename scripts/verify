@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Compose 中 verify 一次性服务的入口。
+
+按顺序执行三类交付校验，任一步失败即以非零退出码报告：
+
+  1. 代码测试：pytest 测试套件（最大流/最小割、校验、API）；
+  2. 构建：字节码编译 + FastAPI 应用导入（确保可启动）；
+  3. 导排 API 冒烟：真实拉起 uvicorn，调用 /health 与 /api/audit，
+     覆盖达标放行、失效证据（首条失效管段 + 最小割）、非法输入 400。
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+EPS = 1e-6
+
+PAYLOAD_PASS = {
+    "source": "泄压源V-101",
+    "sink": "焚烧炉F-1",
+    "required_flow": 95,
+    "nodes": ["汇合点A", "汇合点B"],
+    "edges": [
+        {"id": "E1", "from": "泄压源V-101", "to": "汇合点A", "capacity": 100, "maintainable": True},
+        {"id": "E2", "from": "汇合点A", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True},
+        {"id": "E3", "from": "泄压源V-101", "to": "汇合点B", "capacity": 100, "maintainable": True},
+        {"id": "E4", "from": "汇合点B", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True},
+    ],
+}
+
+PAYLOAD_FAIL = {
+    "source": "泄压源V-101",
+    "sink": "焚烧炉F-1",
+    "required_flow": 95,
+    "nodes": ["汇合点A", "汇合点B"],
+    "edges": [
+        {"id": "E1", "from": "泄压源V-101", "to": "汇合点A", "capacity": 100, "maintainable": True},
+        {"id": "E2", "from": "汇合点A", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True},
+        {"id": "E3", "from": "泄压源V-101", "to": "汇合点B", "capacity": 90, "maintainable": True},
+        {"id": "E4", "from": "汇合点B", "to": "焚烧炉F-1", "capacity": 90, "maintainable": True},
+    ],
+}
+
+PAYLOAD_INVALID = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": 10,
+    "nodes": [],
+    "edges": [{"id": "X", "from": "S", "to": "幽灵节点", "capacity": 10, "maintainable": True}],
+}
+
+
+def _log(ok: bool, title: str, detail: str = "") -> None:
+    mark = "PASS" if ok else "FAIL"
+    print(f"[{mark}] {title}" + (f"\n       {detail}" if detail else ""), flush=True)
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def run_tests() -> bool:
+    print("\n=== 1/3 代码测试 (pytest) ===", flush=True)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests"],
+        cwd=ROOT,
+    )
+    _log(proc.returncode == 0, "pytest 测试套件", f"exit={proc.returncode}")
+    return proc.returncode == 0
+
+
+def run_build() -> bool:
+    print("\n=== 2/3 构建检查 ===", flush=True)
+    ok = True
+    proc = subprocess.run(
+        [sys.executable, "-m", "compileall", "-q", "app"],
+        cwd=ROOT,
+    )
+    compile_ok = proc.returncode == 0
+    _log(compile_ok, "字节码编译 compileall", f"exit={proc.returncode}")
+    ok &= compile_ok
+
+    # 导入应用即保证 FastAPI 路由可装配、容器启动不会在导入期崩溃。
+    proc = subprocess.run(
+        [sys.executable, "-c", "from app.main import app; print(sorted(r.path for r in app.routes))"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    import_ok = proc.returncode == 0 and "/api/audit" in proc.stdout and "/health" in proc.stdout
+    _log(import_ok, "FastAPI 应用导入与路由装配", proc.stderr.strip()[-400:] if not import_ok else "")
+    return ok and import_ok
+
+
+def _request(method: str, url: str, payload=None):
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
+
+def run_smoke() -> bool:
+    print("\n=== 3/3 导排 API 冒烟 (真实 uvicorn) ===", flush=True)
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    env = dict(os.environ, PYTHONPATH=str(ROOT))
+    server = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app",
+         "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    ok = True
+    try:
+        # 等待健康检查通过
+        healthy = False
+        for _ in range(60):
+            if server.poll() is not None:
+                out = server.stdout.read() if server.stdout else ""
+                _log(False, "uvicorn 启动", f"进程提前退出\n{out[-800:]}")
+                return False
+            try:
+                status, body = _request("GET", f"{base}/health")
+                if status == 200 and body.get("status") == "ok":
+                    healthy = True
+                    break
+            except Exception:
+                time.sleep(0.5)
+        _log(healthy, "GET /health 健康检查")
+        ok &= healthy
+        if not healthy:
+            return False
+
+        # 达标情景：正常 200，单管段失效后仍有一条 100 干线
+        status, body = _request("POST", f"{base}/api/audit", PAYLOAD_PASS)
+        pass_ok = (
+            status == 200
+            and body.get("passed") is True
+            and body["normal"]["max_flow"] == 200
+            and len(body["scenarios"]) == 4
+            and all(s["max_flow"] == 100 and s["meets"] for s in body["scenarios"])
+        )
+        _log(pass_ok, "达标网络审计放行 (正常=200，任一干线失效=100≥95)",
+             "" if pass_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= pass_ok
+
+        # 失效情景：首条不达标为录入顺序第 1 条，最小割可复核
+        status, body = _request("POST", f"{base}/api/audit", PAYLOAD_FAIL)
+        f = body.get("failure") or {}
+        cut = f.get("cut") or {}
+        fail_ok = (
+            status == 200
+            and body.get("passed") is False
+            and f.get("position") == 1
+            and f.get("max_flow") == 90
+            and abs(cut.get("capacity", -1) - f.get("max_flow", -2)) < EPS  # 最大流=最小割
+            and PAYLOAD_FAIL["source"] in cut.get("source_side_nodes", [])
+            and PAYLOAD_FAIL["sink"] in cut.get("sink_side_nodes", [])
+            and len(cut.get("cut_edges", [])) >= 1
+        )
+        _log(fail_ok, "失效网络返回首条失效管段(顺序#1)与最小割证据(割容量=90=最大流)",
+             "" if fail_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= fail_ok
+
+        # 非法节点引用必须被拒绝
+        status, body = _request("POST", f"{base}/api/audit", PAYLOAD_INVALID)
+        invalid_ok = status == 400 and bool(body.get("error"))
+        _log(invalid_ok, f"节点引用无效返回 400（实际 HTTP {status}：{body.get('error', '')}）")
+        ok &= invalid_ok
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+    return ok
+
+
+def main() -> int:
+    print("==== verify：代码测试 + 构建 + 导排 API 冒烟 ====", flush=True)
+    results = {
+        "tests": run_tests(),
+        "build": run_build(),
+        "smoke": run_smoke(),
+    }
+    print("\n==== 汇总 ====", flush=True)
+    for name, ok in results.items():
+        print(f"  {name:>6}: {'PASS' if ok else 'FAIL'}", flush=True)
+    if all(results.values()):
+        print("verify 全部通过，退出码 0", flush=True)
+        return 0
+    print("verify 存在失败项，退出码 1", flush=True)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -98,3 +98,93 @@ def test_audit_non_json_body_400():
     r = client.post("/api/audit", content=b"not-json",
                     headers={"Content-Type": "application/json"})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# 限时送达复核 POST /api/time-window-review
+# ---------------------------------------------------------------------------
+
+TW_PASS = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": 50,
+    "window_minutes": 5,
+    "nodes": [],
+    "edges": [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 100,
+         "maintainable": False, "duration": 1},
+    ],
+}
+
+TW_DELAY = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": 50,
+    "window_minutes": 5,
+    "nodes": [],
+    "edges": [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 100,
+         "maintainable": False, "duration": 2},
+    ],
+}
+
+
+def test_time_window_review_pass():
+    r = client.post("/api/time-window-review", json=TW_PASS)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is True
+    assert body["stage"] == "time_window"
+    assert body["target_total"] == 250
+    assert body["delivered_total"] == 250
+    assert body["failure"] is None
+    assert body["audit"]["passed"] is True
+    assert body["service"] == "flare-audit"
+
+
+def test_time_window_review_late_arrival_fails_with_cut():
+    r = client.post("/api/time-window-review", json=TW_DELAY)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    # t=0…3 产出可在 ≤5 到达：200/250
+    assert body["delivered_total"] == 200
+    f = body["failure"]
+    assert f["first_constrained_minute"] == 4
+    cut = f["cut"]
+    # 最大流 / 最小割：时间层割容量 == 实际送达量
+    assert cut["capacity"] == 200 == cut["delivered_total"]
+    assert cut["source_side_time_nodes"]
+    assert cut["sink_side_time_nodes"]
+
+
+def test_time_window_review_audit_failed_short_circuit():
+    payload = dict(TW_PASS)
+    payload["edges"] = [dict(TW_PASS["edges"][0], maintainable=True)]
+    r = client.post("/api/time-window-review", json=payload)
+    body = r.json()
+    assert body["passed"] is False
+    assert body["stage"] == "audit_failed"
+    assert body["time_window"] is None
+    assert body["audit"]["passed"] is False
+
+
+def test_time_window_review_invalid_duration_400():
+    payload = dict(TW_PASS)
+    payload["edges"] = [dict(TW_PASS["edges"][0], duration=0)]
+    r = client.post("/api/time-window-review", json=payload)
+    assert r.status_code == 400
+    assert "正整数" in r.json()["error"]
+
+
+def test_time_window_review_invalid_window_400():
+    payload = dict(TW_PASS, window_minutes=3.5)
+    r = client.post("/api/time-window-review", json=payload)
+    assert r.status_code == 400
+    assert "窗口长度" in r.json()["error"]
+
+
+def test_time_window_review_non_json_400():
+    r = client.post("/api/time-window-review", content=b"xxx",
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 400

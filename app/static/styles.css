@@ -171,3 +171,19 @@ tr.row-fail td { font-weight: 600; }
 
 footer { padding-bottom: 40px; }
 code { background: #eef1f5; padding: 1px 6px; border-radius: 4px; font-size: 12.5px; }
+
+/* 限时送达复核 */
+.tw-action { justify-content: flex-end; }
+.tw-action .btn { margin-top: 22px; width: 100%; }
+.tw-chips { max-height: 220px; overflow-y: auto; align-content: flex-start; }
+.tw-reject {
+  margin-top: 14px; color: var(--fail); font-size: 14px;
+  background: var(--fail-bg); border: 1px solid #f2c1bb; border-radius: 6px;
+  padding: 10px 14px;
+}
+#tw-cut-evidence { border-color: #e6c94d; background: #fffdf4; }
+#tw-cut-evidence h2 { color: #7a5b00; }
+#tw-cut-evidence h3 { margin-top: 12px; }
+.saturated-yes { color: var(--fail); font-weight: 700; }
+.saturated-no { color: var(--muted); }
+input:disabled { background: #f2f4f7; color: var(--muted); }

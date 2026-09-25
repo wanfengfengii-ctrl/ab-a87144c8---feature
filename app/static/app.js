@@ -1,8 +1,9 @@
-/* 事故导排网络检修审计 —— 前端逻辑
+/* 事故导排网络检修审计 + 限时送达复核 —— 前端逻辑
  *
  * 职责边界：前端只负责录入草稿与展示**服务端业务 API** 返回的结论，
  * 不在本地计算任何最大流 / 判定。草稿一旦在上次审计后被改动，旧结论
- * 立即标记为过期，不会被当作当前草稿的结果。
+ * 立即标记为过期，不会被当作当前草稿的结果。检修审计与限时送达复核
+ * 各自维护独立的“上次结论签名”，互不冒用结论。
  */
 (function () {
   "use strict";
@@ -11,25 +12,26 @@
 
   const state = {
     nodes: [],          // 汇合节点名称（不含源/汇）
-    edges: [],          // {id, from, to, capacity, maintainable}
-    lastAuditSignature: null,  // 上次成功提交时草稿的签名
+    edges: [],          // {id, from, to, capacity, duration, maintainable}
+    lastAuditSignature: null,  // 上次成功提交审计时草稿的签名
+    lastReviewSignature: null, // 上次成功提交限时复核时（草稿+窗口）的签名
   };
 
   /* ---------------- 示例数据 ---------------- */
 
   // 达标示例：两条 100 容量干线在源/汇之间并联，要求 95，
-  // 任一可检修管段失效后仍至少剩 100 容量。
+  // 任一可检修管段失效后仍至少剩 100 容量。时长均为 1~2 分钟。
   const EXAMPLE_PASS = {
     source: "泄压源V-101",
     sink: "焚烧炉F-1",
     required_flow: 95,
     nodes: ["汇合点A", "汇合点B"],
     edges: [
-      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, maintainable: true },
-      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, maintainable: true },
-      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 100, maintainable: true },
-      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 100, maintainable: true },
-      { id: "E5", from: "汇合点A", to: "汇合点B", capacity: 40, maintainable: false },
+      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, duration: 1, maintainable: true },
+      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, duration: 1, maintainable: true },
+      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 100, duration: 2, maintainable: true },
+      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 100, duration: 2, maintainable: true },
+      { id: "E5", from: "汇合点A", to: "汇合点B", capacity: 40, duration: 1, maintainable: false },
     ],
   };
 
@@ -41,10 +43,10 @@
     required_flow: 95,
     nodes: ["汇合点A", "汇合点B"],
     edges: [
-      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, maintainable: true },
-      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, maintainable: true },
-      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 90, maintainable: true },
-      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 90, maintainable: true },
+      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, duration: 1, maintainable: true },
+      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, duration: 1, maintainable: true },
+      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 90, duration: 3, maintainable: true },
+      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 90, duration: 3, maintainable: true },
     ],
   };
 
@@ -121,6 +123,17 @@
       capInput.addEventListener("input", () => { edge.capacity = capInput.value; markDirty(); });
       tdCap.appendChild(capInput);
 
+      const tdDur = document.createElement("td");
+      const durInput = document.createElement("input");
+      durInput.type = "number";
+      durInput.min = "1";
+      durInput.step = "1";
+      durInput.placeholder = "正整数";
+      durInput.value = edge.duration === undefined || edge.duration === null ? "" : edge.duration;
+      durInput.title = "该管段的正整数输送时长（分钟），用于限时时间层展开";
+      durInput.addEventListener("input", () => { edge.duration = durInput.value; markDirty(); });
+      tdDur.appendChild(durInput);
+
       const tdMaint = document.createElement("td");
       tdMaint.className = "center";
       const cb = document.createElement("input");
@@ -139,7 +152,7 @@
       delBtn.addEventListener("click", () => { state.edges.splice(i, 1); renderEdges(); markDirty(); });
       tdDel.appendChild(delBtn);
 
-      tr.append(tdNo, tdId, tdFrom, tdArrow, tdTo, tdCap, tdMaint, tdDel);
+      tr.append(tdNo, tdId, tdFrom, tdArrow, tdTo, tdCap, tdDur, tdMaint, tdDel);
       body.appendChild(tr);
     });
   }
@@ -163,6 +176,8 @@
         from: (e.from || "").trim(),
         to: (e.to || "").trim(),
         capacity: e.capacity === "" || e.capacity === null ? null : Number(e.capacity),
+        // 正整数输送时长；审计接口会忽略该字段，限时复核要求其为正整数
+        duration: e.duration === "" || e.duration === null ? null : Number(e.duration),
         maintainable: !!e.maintainable,
       })),
     };
@@ -173,13 +188,25 @@
     return JSON.stringify(currentPayload());
   }
 
+  // 限时复核签名额外包含窗口长度
+  function reviewSignature() {
+    return JSON.stringify({ ...currentPayload(), window_minutes: $("in-window").value });
+  }
+
   function markDirty() {
-    if (state.lastAuditSignature === null) return;
-    const stale = signature() !== state.lastAuditSignature;
-    $("stale-banner").classList.toggle("hidden", !stale);
-    $("draft-hint").textContent = stale
-      ? "草稿已修改，结论区显示的是旧结论，请重新提交审计。"
-      : "";
+    if (state.lastAuditSignature !== null) {
+      const stale = signature() !== state.lastAuditSignature;
+      $("stale-banner").classList.toggle("hidden", !stale);
+      $("draft-hint").textContent = stale
+        ? "草稿已修改，结论区显示的是旧结论，请重新提交审计。"
+        : "";
+    }
+    // 管网任何变更都会使旧限时结论过期
+    if (state.lastReviewSignature !== null) {
+      $("tw-stale-banner").classList.toggle(
+        "hidden", reviewSignature() === state.lastReviewSignature
+      );
+    }
   }
 
   function clearResult() {
@@ -346,28 +373,237 @@
     }
   }
 
+  /* ---------------- 限时送达复核（真实业务 API） ---------------- */
+
+  function twEdgeLabel(e) {
+    const id = e.edge_id ? `（${e.edge_id}）` : "";
+    return `第 ${e.position} 条管段${id}`;
+  }
+
+  function renderTimeChips(el, items) {
+    el.innerHTML = "";
+    if (!items.length) {
+      const c = document.createElement("span");
+      c.className = "chip empty";
+      c.textContent = "（无）";
+      el.appendChild(c);
+      return;
+    }
+    items.forEach((n) => {
+      const c = document.createElement("span");
+      // 源/汇节点用对应侧色调，其余时态节点用中性色
+      c.className = "chip";
+      c.textContent = n.label;
+      c.title = n.node;
+      el.appendChild(c);
+    });
+  }
+
+  function showTwRejection(msg) {
+    $("tw-result").classList.add("hidden");
+    const box = $("tw-reject");
+    box.classList.remove("hidden");
+    box.textContent = msg;
+  }
+
+  function clearTwRejection() {
+    $("tw-reject").classList.add("hidden");
+    $("tw-reject").textContent = "";
+  }
+
+  function renderTwAuditFailure(audit) {
+    $("tw-result").classList.remove("hidden");
+    $("tw-conclusion").classList.add("hidden");
+    $("tw-audit-failed").classList.remove("hidden");
+    const f = audit.failure || {};
+    $("tw-audit-fail-edge").textContent =
+      f.stage === "normal"
+        ? "（正常网络本身不达标）"
+        : `第 ${f.position} 条管段${f.edge_id ? `（${f.edge_id}）` : ""}：${f.from} → ${f.to}`;
+  }
+
+  function renderTimeWindow(data) {
+    clearTwRejection();
+    $("tw-result").classList.remove("hidden");
+    $("tw-audit-failed").classList.add("hidden");
+    $("tw-conclusion").classList.remove("hidden");
+
+    const f = data.failure;
+    const passed = !!data.passed;
+    $("tw-pass-panel").classList.toggle("hidden", !passed);
+    $("tw-fail-panel").classList.toggle("hidden", passed);
+
+    $("tw-m-target").textContent = fmt(data.target_total);
+    $("tw-m-delivered").textContent = fmt(data.delivered_total);
+    $("tw-m-shortage").textContent = fmt(data.shortage || 0);
+    $("tw-target").value = `${fmt(data.required_flow)} × ${data.window_minutes} = ${fmt(data.target_total)}`;
+
+    if (passed) {
+      $("tw-pass-window").textContent = String(data.window_minutes);
+      $("tw-pass-required").textContent = fmt(data.required_flow);
+      $("tw-pass-target").textContent = fmt(data.target_total);
+      $("tw-pass-delivered").textContent = fmt(data.delivered_total);
+    } else {
+      $("tw-fail-target").textContent = fmt(f.target_total);
+      $("tw-fail-delivered").textContent = fmt(f.delivered_total);
+      $("tw-fail-shortage").textContent = fmt(f.shortage);
+      $("tw-fail-minute").textContent = String(f.first_constrained_minute);
+      $("tw-fail-stranded").textContent =
+        f.stranded_from_minute === null || f.stranded_from_minute === undefined
+          ? "（跨层管段容量先受限）"
+          : `（第 ${f.stranded_from_minute} 分钟起源头产量已无法按时入网，存在途中滞留）`;
+    }
+
+    // 逐分钟送达（补齐 0…W 中无送达的分钟，直观显示延迟）
+    const dMap = new Map((data.deliveries || []).map((d) => [d.minute, d.delivered]));
+    const dBody = $("tw-deliveries-body");
+    dBody.innerHTML = "";
+    for (let t = 0; t <= data.window_minutes; t += 1) {
+      const tr = document.createElement("tr");
+      const v = dMap.has(t) ? dMap.get(t) : 0;
+      [String(t), fmt(v), t < data.window_minutes ? fmt(data.required_flow) : "—（截止时刻）"]
+        .forEach((c) => { const td = document.createElement("td"); td.textContent = c; tr.appendChild(td); });
+      if (v === 0) tr.className = "row-fail";
+      dBody.appendChild(tr);
+    }
+
+    // 管段—时段流量
+    const fBody = $("tw-flows-body");
+    fBody.innerHTML = "";
+    const flows = (data.edge_flows || []).slice().sort(
+      (a, b) => a.departure_minute - b.departure_minute || a.position - b.position
+    );
+    if (!flows.length) {
+      fBody.innerHTML = '<tr><td colspan="7" class="center tip">窗口内没有任何管段承担流量（气体无法到达焚烧端）。</td></tr>';
+    } else {
+      flows.forEach((x) => {
+        const tr = document.createElement("tr");
+        [
+          twEdgeLabel(x),
+          `${x.from} → ${x.to}`,
+          `${x.duration} 分钟`,
+          String(x.departure_minute),
+          String(x.arrival_minute),
+          fmt(x.flow),
+          fmt(x.capacity),
+        ].forEach((c) => { const td = document.createElement("td"); td.textContent = c; tr.appendChild(td); });
+        fBody.appendChild(tr);
+      });
+    }
+
+    // 时间层最小割
+    const evidence = $("tw-cut-evidence");
+    if (!passed && f && f.cut) {
+      evidence.classList.remove("hidden");
+      const cut = f.cut;
+      $("tw-cut-identity").textContent =
+        `割容量 ${fmt(cut.capacity)} = 实际送达 ${fmt(cut.delivered_total)}`;
+      renderTimeChips($("tw-cut-source"), cut.source_side_time_nodes);
+      renderTimeChips($("tw-cut-sink"), cut.sink_side_time_nodes);
+
+      const pBody = $("tw-cut-pipes-body");
+      pBody.innerHTML = "";
+      if (!cut.cut_pipe_edges.length) {
+        pBody.innerHTML = '<tr><td colspan="8" class="center tip">无跨层割管段：限制来自输送延迟（末尾几分钟产出无法在截止前到达），见下方跨割供给边。</td></tr>';
+      } else {
+        cut.cut_pipe_edges.forEach((p) => {
+          const tr = document.createElement("tr");
+          [
+            String(p.position), twEdgeLabel(p), p.from_time_node, "→", p.to_time_node,
+            fmt(p.capacity), fmt(p.flow),
+          ].forEach((c) => { const td = document.createElement("td"); td.textContent = c; tr.appendChild(td); });
+          const tdSat = document.createElement("td");
+          tdSat.textContent = p.saturated ? "是（瓶颈）" : "否";
+          tdSat.className = p.saturated ? "saturated-yes" : "saturated-no";
+          tr.appendChild(tdSat);
+          pBody.appendChild(tr);
+        });
+      }
+
+      const sBody = $("tw-cut-supplies-body");
+      sBody.innerHTML = "";
+      cut.cut_supply_edges.forEach((s) => {
+        const tr = document.createElement("tr");
+        [String(s.minute), s.time_node, fmt(s.capacity), fmt(s.flow)].forEach((c) => {
+          const td = document.createElement("td"); td.textContent = c; tr.appendChild(td);
+        });
+        sBody.appendChild(tr);
+      });
+    } else {
+      evidence.classList.add("hidden");
+    }
+
+    $("tw-result").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function submitTimeWindowReview() {
+    const payload = currentPayload();
+    const w = $("in-window").value;
+    payload.window_minutes = w === "" ? null : Number(w);
+    $("btn-tw-review").disabled = true;
+    clearTwRejection();
+    try {
+      const resp = await fetch("/api/time-window-review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        state.lastReviewSignature = null;
+        $("tw-stale-banner").classList.add("hidden");
+        showTwRejection(data.error || `限时复核请求失败（HTTP ${resp.status}）`);
+        return;
+      }
+      state.lastReviewSignature = reviewSignature();
+      $("tw-stale-banner").classList.add("hidden");
+      if (data.stage === "audit_failed") {
+        renderTwAuditFailure(data.audit);
+      } else {
+        renderTimeWindow(data);
+      }
+    } catch (e) {
+      state.lastReviewSignature = null;
+      showTwRejection("无法连接限时复核服务：" + e.message);
+    } finally {
+      $("btn-tw-review").disabled = false;
+    }
+  }
+
   /* ---------------- 载入 / 清空 ---------------- */
 
   function loadExample(ex) {
     clearResult();
+    clearTwResult();
     $("in-source").value = ex.source;
     $("in-sink").value = ex.sink;
     $("in-required").value = String(ex.required_flow);
     state.nodes = ex.nodes.slice();
     state.edges = ex.edges.map((e) => ({ ...e }));
     state.lastAuditSignature = null;
+    state.lastReviewSignature = null;
     renderAll();
   }
 
   function clearAll() {
     clearResult();
+    clearTwResult();
     $("in-source").value = "";
     $("in-sink").value = "";
     $("in-required").value = "";
+    $("in-window").value = "";
+    $("tw-target").value = "";
     state.nodes = [];
     state.edges = [];
     state.lastAuditSignature = null;
+    state.lastReviewSignature = null;
     renderAll();
+  }
+
+  function clearTwResult() {
+    $("tw-result").classList.add("hidden");
+    $("tw-reject").classList.add("hidden");
+    $("tw-stale-banner").classList.add("hidden");
   }
 
   /* ---------------- 事件绑定 ---------------- */
@@ -381,16 +617,17 @@
   });
 
   $("btn-add-edge").addEventListener("click", () => {
-    state.edges.push({ id: "", from: "", to: "", capacity: "", maintainable: true });
+    state.edges.push({ id: "", from: "", to: "", capacity: "", duration: "", maintainable: true });
     renderEdges();
     markDirty();
   });
 
   $("btn-audit").addEventListener("click", submitAudit);
+  $("btn-tw-review").addEventListener("click", submitTimeWindowReview);
   $("btn-example-pass").addEventListener("click", () => loadExample(EXAMPLE_PASS));
   $("btn-example-fail").addEventListener("click", () => loadExample(EXAMPLE_FAIL));
   $("btn-clear").addEventListener("click", clearAll);
-  ["in-source", "in-sink", "in-required"].forEach((id) =>
+  ["in-source", "in-sink", "in-required", "in-window"].forEach((id) =>
     $(id).addEventListener("input", markDirty)
   );
 

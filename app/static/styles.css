@@ -169,5 +169,18 @@ tr.row-fail td { font-weight: 600; }
 .reject { color: var(--fail); }
 .reject-msg { font-size: 14.5px; background: var(--fail-bg); border-radius: 6px; padding: 10px 14px; margin: 0 0 8px; }
 
+/* 限时窗口复核 */
+.action-label { justify-content: flex-end; }
+#btn-window-review { width: 100%; margin-top: 22px; }
+.edge-period-block {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  margin-bottom: 10px; background: #fafbfd;
+}
+.edge-period-head { margin: 0 0 8px; font-size: 13.5px; font-weight: 600; color: #2c394a; }
+.edge-period-block .cut-table { font-size: 12.5px; }
+tr.row-flow { background: #f3f8f4; }
+#window-card .evidence { border-color: #e8d28a; background: #fffdf6; }
+#window-pass-panel, #window-fail-panel { margin-bottom: 14px; }
+
 footer { padding-bottom: 40px; }
 code { background: #eef1f5; padding: 1px 6px; border-radius: 4px; font-size: 12.5px; }

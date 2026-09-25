@@ -62,6 +62,7 @@
               <th>方向</th>
               <th>终点</th>
               <th>最大流量(容量上限)</th>
+              <th>输送时长(分钟)</th>
               <th class="center">可检修<br/><span class="tip">临时失效模拟</span></th>
               <th style="width:48px"></th>
             </tr>
@@ -181,10 +182,152 @@
     </div>
   </section>
 
+  <!-- ============ 事故初限时窗口复核 ============ -->
+  <section class="card" id="window-card">
+    <h2>⑤ 事故初限时窗口复核（时间层展开）</h2>
+    <p class="tip">
+      检修前审计通过后可发起：服务端<strong>先按既有规则重新审计当前草稿</strong>，
+      再把事故最初每分钟展开为有向时间层——管段容量按分钟各一份、气体可在汇合节点等待、
+      <strong>到达时间超出窗口的流量不计入</strong>。每条管段须在上方录入正整数
+      <strong>输送时长</strong>；仅当源头逐分钟持续产生的气体全部按时送达焚烧端才通过。
+    </p>
+
+    <div class="grid3">
+      <label>事故初每分钟持续泄压流量
+        <input id="in-relief" type="number" min="0" step="any" placeholder="如：100（每分钟）" />
+      </label>
+      <label>限时窗口长度（分钟，正整数）
+        <input id="in-window" type="number" min="1" step="1" placeholder="如：30" />
+      </label>
+      <label class="action-label">
+        <button type="button" class="btn primary" id="btn-window-review">提交限时复核</button>
+      </label>
+    </div>
+    <div class="submit-row">
+      <span id="window-hint" class="tip"></span>
+    </div>
+
+    <div id="window-reject" class="reject-msg hidden"></div>
+
+    <div id="window-result" class="hidden">
+      <div class="stale-banner hidden" id="window-stale-banner">
+        ⚠ 管网草稿或窗口参数在上次限时复核之后已被修改，以下为<strong>旧窗口结论</strong>，
+        不代表当前输入；请重新提交限时复核。
+      </div>
+
+      <div id="window-audit-block" class="hidden">
+        <div class="verdict fail">
+          <span class="badge fail">✘ 重新审计未通过，未展开时间层</span>
+          <p>当前草稿按既有检修审计规则不达标（<span id="window-audit-reason"></span>），
+            限时复核不会在不合格管网上继续。请先修正草稿并使审计通过。</p>
+        </div>
+      </div>
+
+      <div id="window-verdict-block" class="hidden">
+        <div class="verdict pass hidden" id="window-pass-panel">
+          <span class="badge pass">✔ 限时窗口复核通过</span>
+          <p>事故最初 <strong id="w-window"></strong> 分钟内，源头每分钟持续产生
+            <strong id="w-relief"></strong>，截至截止时刻共
+            <strong id="w-delivered"></strong> / 应排 <strong id="w-target"></strong>
+            全部按时送达安全焚烧端，无在途滞留被误判。</p>
+        </div>
+        <div class="verdict fail hidden" id="window-fail-panel">
+          <span class="badge fail">✘ 限时窗口复核不通过</span>
+          <p>截至截止时刻实际按时送达 <strong id="w-delivered-f"></strong>，
+            应排 <strong id="w-target-f"></strong>，缺口
+            <strong id="w-shortfall"></strong>；首个受限时刻为第
+            <strong id="w-first-minute"></strong> 分钟末——该刻应到
+            <strong id="w-req-at"></strong>、实到
+            <strong id="w-arr-at"></strong>。</p>
+        </div>
+
+        <div class="metric-row">
+          <div class="metric">
+            <span class="metric-label">源头总产量（应排量）</span>
+            <span class="metric-value" id="w-m-target"></span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">截止前实际按时送达量</span>
+            <span class="metric-value" id="w-m-delivered"></span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">未按时送达（缺口）</span>
+            <span class="metric-value" id="w-m-shortfall"></span>
+          </div>
+        </div>
+
+        <div class="block">
+          <h3>逐分钟：源头产生 vs 焚烧端按时送达</h3>
+          <div class="table-scroll">
+            <table class="cut-table">
+              <thead><tr><th>分钟(层)</th><th>源头该分钟产生/入网</th><th>该分钟末焚烧端按时送达</th></tr></thead>
+              <tbody id="w-minute-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="block">
+          <h3>管段—时段流量（容量按分钟生效）</h3>
+          <div id="w-edge-periods"></div>
+        </div>
+
+        <div class="evidence hidden" id="w-bottleneck">
+          <h2>时间层最小割证据（可复核）</h2>
+          <p class="tip">依据最大流 / 最小割定理：把首个受限时刻前缀展开图的时态节点分为
+            “源侧 / 焚烧端侧”，所有跨层管段副本容量与跨割注入容量之和恰等于该刻累计按时送达量。
+            另有“受限时刻之后才到达的在途管段”和“按规则未展开的超窗管段”，用于定位延迟环节。</p>
+          <div class="cut-grid">
+            <div>
+              <h3>源侧时态节点（含 (泄压源,0)）</h3>
+              <div id="w-cut-source" class="chips"></div>
+            </div>
+            <div>
+              <h3>焚烧端侧时态节点（含各焚烧端层）</h3>
+              <div id="w-cut-sink" class="chips"></div>
+            </div>
+          </div>
+          <h3>跨层管段容量（源侧时态 → 焚烧端侧时态）</h3>
+          <div class="table-scroll">
+            <table class="cut-table">
+              <thead><tr>
+                <th>#</th><th>管段</th><th>出发时态节点</th><th>方向</th><th>到达时态节点</th>
+                <th>输送时长</th><th>时段流量</th><th>分钟容量</th>
+              </tr></thead>
+              <tbody id="w-cut-edges"></tbody>
+              <tfoot><tr>
+                <td colspan="7" class="right">割容量（含跨割注入，＝该刻累计按时送达）</td>
+                <td id="w-cut-capacity" class="strong"></td>
+              </tr></tfoot>
+            </table>
+          </div>
+          <div class="block" id="w-late-block">
+            <h3>受限时刻之后才到达的在途跨层管段（不计入该刻送达）</h3>
+            <div class="table-scroll">
+              <table class="cut-table">
+                <thead><tr><th>#</th><th>管段</th><th>出发层</th><th>到达层</th><th>流量</th></tr></thead>
+                <tbody id="w-late-edges"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="block" id="w-oow-block">
+            <h3>到达必超窗口、按规则未展开的管段时段（纯延迟定位）</h3>
+            <div class="table-scroll">
+              <table class="cut-table">
+                <thead><tr><th>#</th><th>管段</th><th>出发层</th><th>预计到达层</th><th>分钟容量</th></tr></thead>
+                <tbody id="w-oow-edges"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
 </main>
 
 <footer class="wrap">
-  <p class="tip">结论来自服务端业务 API <code>POST /api/audit</code>（Dinic 最大流 + 残余网络最小割），前端不做流量结论计算。</p>
+  <p class="tip">结论均来自服务端业务 API：<code>POST /api/audit</code>（Dinic 最大流 + 残余网络最小割）与
+    <code>POST /api/time-window-review</code>（先重新审计，再按分钟展开有向时间层求送达与时间层最小割），前端不做任何流量结论计算。</p>
 </footer>
 
 <script src="/static/app.js"></script>

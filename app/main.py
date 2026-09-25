@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .flow import NetworkValidationError, audit_network
+from .flow import NetworkValidationError, audit_network, time_window_review
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -17,9 +17,10 @@ app = FastAPI(
     title="化工园区事故导排网络检修审计",
     version=__version__,
     description=(
-        "录入泄压源、安全焚烧端、汇合节点与带方向/容量/检修标记的管段，"
+        "录入泄压源、安全焚烧端、汇合节点与带方向/容量/检修标记/输送时长的管段，"
         "在正常网络及每条可检修管段临时失效后的残余网络上独立求最大流，"
-        "判定事故持续排出流量是否始终可达。"
+        "判定事故持续排出流量是否始终可达；审计通过后可做事故初限时窗口复核，"
+        "按分钟展开有向时间层，确认泄压气体按时送达焚烧端而非滞留途中。"
     ),
 )
 
@@ -58,6 +59,37 @@ async def audit(request: Request) -> dict:
         nodes=payload.get("nodes", []),
         edges=payload.get("edges", []),
         required_flow=payload.get("required_flow"),
+    )
+    result["service"] = "flare-audit"
+    result["version"] = __version__
+    return result
+
+
+@app.post("/api/time-window-review")
+async def time_window_review_api(request: Request) -> dict:
+    """检修审计通过后的事故初限时窗口复核。
+
+    服务端**先按既有规则重新审计当前草稿**（审计不过直接返回，不展开
+    时间层），再把每分钟展开为有向时间层：管段容量按分钟生效、气体可在
+    汇合节点等待、超出窗口到达的流量不计入。返回截止时刻前实际按时送达量
+    与管段—时段流量；窗口不够时附首个受限时刻的时间层最小割证据。
+    方向、容量、输送时长、窗口参数等业务输入无效时返回 400。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "请求体必须是合法 JSON", "field": None})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象", "field": None})
+
+    result = time_window_review(
+        source=payload.get("source"),
+        sink=payload.get("sink"),
+        nodes=payload.get("nodes", []),
+        edges=payload.get("edges", []),
+        required_flow=payload.get("required_flow"),
+        relief_flow=payload.get("relief_flow"),
+        window_minutes=payload.get("window_minutes"),
     )
     result["service"] = "flare-audit"
     result["version"] = __version__
